@@ -1930,7 +1930,7 @@ define([
         if (defined(link)) {
             var href = queryStringValue(link, 'href', namespaces.kml);
             if (defined(href)) {
-                href = resolveHref(href, undefined, sourceUri, uriResolver);
+                href = resolveHref(href, dataSource._proxy, sourceUri, uriResolver);
                 var viewRefreshMode = queryStringValue(link, 'viewRefreshMode', namespaces.kml);
                 var viewBoundScale = defaultValue(queryStringValue(link, 'viewBoundScale', namespaces.kml), 1.0);
                 var defaultViewFormat = (viewRefreshMode === 'onStop') ? 'BBOX=[bboxWest],[bboxSouth],[bboxEast],[bboxNorth]' : '';
@@ -1942,7 +1942,10 @@ define([
                 var linkUrl = processNetworkLinkQueryString(dataSource._camera, dataSource._canvas, joinUrls(href, queryString, false),
                                                             viewBoundScale, dataSource._lastCameraView.bbox);
 
-                var promise = when(load(dataSource, networkLinkCollection, linkUrl), function(rootElement) {
+                var promise = when(load(dataSource, networkLinkCollection, linkUrl, {
+                    sourceUri: sourceUri,
+                    uriResolver: uriResolver,
+                }), function(rootElement) {
                     var entities = dataSource._entityCollection;
                     var newEntities = networkLinkCollection.values;
                     var networkLinkAvailability = networkEntity.availability;
@@ -2105,34 +2108,58 @@ define([
         return deferred.promise;
     }
 
+    function printI(i) {
+        return function(res) {
+            console.log(i);
+            return res;
+        };
+    }
+
     function loadKmz(dataSource, entityCollection, blob, sourceUri) {
         var deferred = when.defer();
         zip.createReader(new zip.BlobReader(blob), function(reader) {
             reader.getEntries(function(entries) {
                 var promises = [];
-                var foundKML = false;
                 var uriResolver = {};
+                var kmlDocEntry;
+                var kmlDocDefer;
                 for (var i = 0; i < entries.length; i++) {
                     var entry = entries[i];
                     if (!entry.directory) {
                         var innerDefer = when.defer();
-                        promises.push(innerDefer.promise);
-                        if (!foundKML && /\.kml$/i.test(entry.filename)) {
+                        promises.push(innerDefer.promise.then(printI(i)));
+                        var filename = entry.filename;
+                        if (/\.kml$/i.test(filename)) {
                             //Only the first KML file found in the zip is used.
                             //https://developers.google.com/kml/documentation/kmzarchives
-                            foundKML = true;
-                            loadXmlFromZip(reader, entry, uriResolver, innerDefer);
+                            //In addition we also check for a KML file at the root of the archive
+                            // and use that because that is what Google Earth does.
+                            if (defined(kmlDocEntry) && !/\//.test(filename)) {
+                                loadDataUriFromZip(reader, kmlDocEntry, uriResolver, kmlDocDefer);
+                                kmlDocEntry = undefined;
+                            }
+                            if (!defined(kmlDocEntry)) {
+                                kmlDocEntry = entry;
+                                kmlDocDefer = innerDefer;
+                            }
                         } else {
                             loadDataUriFromZip(reader, entry, uriResolver, innerDefer);
                         }
                     }
                 }
+
+                if (defined(kmlDocEntry)) {
+                    // Now that we know the KML we'll load it
+                    loadXmlFromZip(reader, kmlDocEntry, uriResolver, kmlDocDefer);
+                }
+                console.log('Promise Count:' + promises.length);
                 when.all(promises).then(function() {
                     reader.close();
-                    if (!defined(uriResolver.kml)) {
+                    if (!defined(kmlDocEntry)) {
                         deferred.reject(new RuntimeError('KMZ file does not contain a KML document.'));
                         return;
                     }
+
                     uriResolver.keys = Object.keys(uriResolver);
                     return loadKml(dataSource, entityCollection, uriResolver.kml, sourceUri, uriResolver);
                 }).then(deferred.resolve).otherwise(deferred.reject);
@@ -2147,6 +2174,7 @@ define([
     function load(dataSource, entityCollection, data, options) {
         options = defaultValue(options, defaultValue.EMPTY_OBJECT);
         var sourceUri = options.sourceUri;
+        var uriResolver = options.uriResolver;
 
         var promise = data;
         if (typeof data === 'string') {
@@ -2187,11 +2215,11 @@ define([
                             //Return the error
                             throw new RuntimeError(msg);
                         }
-                        return loadKml(dataSource, entityCollection, kml, sourceUri, undefined);
+                        return loadKml(dataSource, entityCollection, kml, sourceUri, uriResolver);
                     });
                 });
             } else {
-                return when(loadKml(dataSource, entityCollection, dataToLoad, sourceUri, undefined));
+                return when(loadKml(dataSource, entityCollection, dataToLoad, sourceUri, uriResolver));
             }
         }).otherwise(function(error) {
             dataSource._error.raiseEvent(dataSource, error);
